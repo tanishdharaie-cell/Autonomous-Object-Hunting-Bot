@@ -1,7 +1,7 @@
 # Assignment 4: The Great Object Hunt - Short Report
 
-**Student Name:** [Write Your Full Name Here]  
-**Roll Number:** [Write Your Roll No Here]  
+**Student Name:** [Tanish Dharaie]  
+**Roll Number:** [25B2217]  
 **Date:** 25 June 2026
 
 ## 1. How Distance was Estimated
@@ -29,7 +29,5 @@
 - Robust visual tracking using CSRT tracker + temporal voting
 - Multi-sensor distance fusion (Depth + LIDAR + bbox size)
 
-**GitHub Repository:** [Add your GitHub link]  
-**Demo Video:** [Add your Google Drive video link]
-
+**GitHub Repository:** (https://github.com/tanishdharaie-cell/erc-assignment-4-object-hunt.git) 
 **Declaration:** This submission fulfills all stages (1-6) and most bonus challenges.
