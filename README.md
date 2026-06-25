@@ -15,14 +15,7 @@ Autonomous object detection, tracking, and navigation system using YOLOv8, depth
 - Safe stopping at target
 - Professional real-time dashboard
 
-## How to Run
 
-```bash
-# Terminal 1: Start Gazebo Simulation
-ros2 launch erc_gazebo_sensors world.launch.py world:=home
-
-# Terminal 2: Run Object Hunter
-ros2 run erc_gazebo_sensors_py object_hunter# The Great Object Hunt - ERC Assignment 4
 
 **Electronics & Robotics Club, IIT Bombay**
 
@@ -37,13 +30,14 @@ Autonomous object detection, tracking, and navigation system using YOLOv8, depth
 - Smooth centering and straight-line approach
 - Obstacle avoidance using LIDAR
 - Safe stopping at target
-- Professional real-time dashboard
+- real-time dashboard
 
 ## How to Run
 
 ```bash
 # Terminal 1: Start Gazebo Simulation
-ros2 launch erc_gazebo_sensors world.launch.py world:=home
+ros2 launch erc_gazebo_sensors spawn_robot.launch.py
+
 
 # Terminal 2: Run Object Hunter
 ros2 run erc_gazebo_sensors_py object_hunter
