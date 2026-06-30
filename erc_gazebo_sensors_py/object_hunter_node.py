@@ -1,53 +1,121 @@
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image, LaserScan
-from geometry_msgs.msg import Twist
-from cv_bridge import CvBridge
-import cv2
-import numpy as np
+import math
 import threading
 import time
+from enum import Enum
 
+import cv2
+import numpy as np
+import rclpy
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Twist
+from rclpy.node import Node
+from sensor_msgs.msg import Image, LaserScan
 from ultralytics import YOLO
+
+
+class MissionState(Enum):
+    IDLE = 0
+    SEARCH = 1
+    TRACK = 2
+    APPROACH = 3
+    RECOVER = 4
+    COMPLETE = 5
 
 
 class ObjectHunterNode(Node):
     def __init__(self):
         super().__init__('object_hunter')
-        self.model = YOLO("yolov8m.pt")
-        self.get_logger().info("YOLOv8m loaded")
+
+        model_path = 'yolov8m.pt'
+        self.model = YOLO(model_path)
+        self.get_logger().info(f'Loaded detector: {model_path}')
 
         self.bridge = CvBridge()
-
         self.create_subscription(Image, 'camera/image', self.image_callback, 10)
         self.create_subscription(Image, '/camera/depth_image', self.depth_callback, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
-
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
+        self.frame_lock = threading.Lock()
         self.latest_rgb = None
         self.latest_depth = None
         self.latest_scan = None
-        self.frame_lock = threading.Lock()
+        self.latest_detections = []
 
         self.target_class = None
-        self.mission_active = False
-        self.stop_distance = 0.65
-
-        # Tracking
-        self.tracker = None
-        self.tracked_bbox = None
-        self.lost_frames = 0
-
+        self.target_track_id = None
+        self.state = MissionState.IDLE
         self.running = True
 
-        self.spin_thread = threading.Thread(target=self.spin_thread_func, daemon=True)
-        self.spin_thread.start()
+        self.stop_distance = 0.80
+        self.goal_tolerance = 0.10
+        self.front_stop_distance = 0.55
+        self.front_slow_distance = 0.90
+        self.target_reacquire_timeout = 1.2
+        self.target_drop_timeout = 3.0
+        self.search_forward_clearance = 1.2
+        self.horizontal_fov_deg = 69.0
 
+        self.max_linear_speed = 0.25
+        self.max_angular_speed = 0.75
+        self.max_linear_accel = 0.20
+        self.max_angular_accel = 1.0
+        self.prev_linear = 0.0
+        self.prev_angular = 0.0
+        self.last_cmd_time = time.time()
+
+        self.search_direction = 1.0
+        self.search_phase_started = time.time()
+        self.last_target_seen_time = 0.0
+
+        self.class_aliases = {
+            'chair': {'chair'},
+            'person': {'person'},
+            'fridge': {'refrigerator'},
+            'cone': {'traffic cone', 'cone'},
+        }
+
+        self.class_thresholds = {
+            'person': 0.55,
+            'chair': 0.45,
+            'refrigerator': 0.45,
+        }
+
+        self.kf = self._build_target_kalman()
+        self.kf_initialized = False
+        self.smoothed_target = None
+        self.last_status_text = 'IDLE'
+
+        self.spin_thread = threading.Thread(target=self.spin_thread_func, daemon=True)
+        self.detect_thread = threading.Thread(target=self.detect_loop, daemon=True)
         self.input_thread = threading.Thread(target=self.input_thread_func, daemon=True)
+
+        self.spin_thread.start()
+        self.detect_thread.start()
         self.input_thread.start()
 
-        self.get_logger().info("Object Hunter Ready!")
+        self.get_logger().info('Object Hunter ready')
+
+    def _build_target_kalman(self):
+        kf = cv2.KalmanFilter(6, 3)
+        # state = [cx, cy, dist, vx, vy, vdist]
+        kf.transitionMatrix = np.array([
+            [1, 0, 0, 1, 0, 0],
+            [0, 1, 0, 0, 1, 0],
+            [0, 0, 1, 0, 0, 1],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1],
+        ], dtype=np.float32)
+        kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+        ], dtype=np.float32)
+        kf.processNoiseCov = np.diag([1.0, 1.0, 0.12, 4.0, 4.0, 0.5]).astype(np.float32)
+        kf.measurementNoiseCov = np.diag([20.0, 20.0, 0.08]).astype(np.float32)
+        kf.errorCovPost = np.eye(6, dtype=np.float32) * 5.0
+        return kf
 
     def spin_thread_func(self):
         while rclpy.ok() and self.running:
@@ -55,185 +123,455 @@ class ObjectHunterNode(Node):
 
     def input_thread_func(self):
         while rclpy.ok() and self.running:
-            if not self.mission_active:
-                print("\n" + "="*60)
-                target = input("Enter target (chair / person / cone / fridge): ").strip().lower()
+            if self.state == MissionState.IDLE:
+                print('\n' + '=' * 60)
+                target = input('Enter target (chair / person / fridge / cone): ').strip().lower()
                 if target:
                     self.target_class = target
-                    self.reset_tracking()
-                    self.mission_active = True
-                    print(f"🎯 Searching for: {target}")
-            time.sleep(0.4)
+                    if not self.target_supported_by_model():
+                        supported = ', '.join(sorted(set(name.lower() for name in self.model.names.values())))
+                        print(
+                            f"❌ '{target}' is not a native class in the current YOLO model.\n"
+                            f"Use a custom-trained model for that object.\n"
+                            f"Supported classes include: {supported}"
+                        )
+                        self.target_class = None
+                        time.sleep(0.2)
+                        continue
 
-    def reset_tracking(self):
-        self.tracker = None
-        self.tracked_bbox = None
-        self.lost_frames = 0
+                    self.reset_target_state()
+                    self.state = MissionState.SEARCH
+                    print(f'🎯 Searching for: {target}')
+            time.sleep(0.2)
+
+    def reset_target_state(self):
+        self.target_track_id = None
+        self.kf = self._build_target_kalman()
+        self.kf_initialized = False
+        self.smoothed_target = None
+        self.last_target_seen_time = 0.0
 
     def image_callback(self, msg):
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
             with self.frame_lock:
                 self.latest_rgb = frame
-        except:
-            pass
+        except Exception as exc:
+            self.get_logger().warning(f'RGB conversion failed: {exc}')
 
     def depth_callback(self, msg):
         try:
-            depth = self.bridge.imgmsg_to_cv2(msg, "32FC1")
+            depth = self.bridge.imgmsg_to_cv2(msg, '32FC1')
             with self.frame_lock:
                 self.latest_depth = depth
-        except:
-            pass
+        except Exception as exc:
+            self.get_logger().warning(f'Depth conversion failed: {exc}')
 
     def scan_callback(self, msg):
         with self.frame_lock:
             self.latest_scan = msg
 
-    def is_target_match(self, class_name):
+    def canonical_classes(self):
         if not self.target_class:
-            return False
-        mapping = {
-            "chair": ["chair"],
-            "person": ["person"],
-            "fridge": ["refrigerator", "fridge"],
-            "cone": ["cone", "traffic light"],
-        }
-        allowed = mapping.get(self.target_class, [self.target_class])
-        return any(a in class_name for a in allowed)
+            return set()
+        return self.class_aliases.get(self.target_class, {self.target_class})
 
-    def process_frame(self, rgb, depth, scan):
-        h, w = rgb.shape[:2]
-        results = self.model(rgb, conf=0.30, imgsz=640, verbose=False)
+    def target_supported_by_model(self):
+        model_classes = {name.lower() for name in self.model.names.values()}
+        return any(name in model_classes for name in self.canonical_classes())
 
-        target_detected = False
-        best_bbox = None
-        best_conf = 0.0
+    def is_target_match(self, class_name):
+        return class_name in self.canonical_classes()
 
-        for result in results:
-            for box in result.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                class_name = self.model.names[int(box.cls[0])].lower()
-                conf = float(box.conf[0])
+    def detect_loop(self):
+        while rclpy.ok() and self.running:
+            if self.state == MissionState.IDLE:
+                time.sleep(0.1)
+                continue
 
-                if self.is_target_match(class_name) and conf > best_conf:
-                    target_detected = True
-                    best_conf = conf
-                    best_bbox = (x1, y1, x2, y2)
+            with self.frame_lock:
+                frame = None if self.latest_rgb is None else self.latest_rgb.copy()
+                depth = None if self.latest_depth is None else self.latest_depth.copy()
+                scan = self.latest_scan
 
-                # Draw all detections
-                color = (0, 255, 0) if self.is_target_match(class_name) else (0, 165, 255)
-                cv2.rectangle(rgb, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(rgb, f"{class_name} {conf:.2f}", (x1, y1-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            if frame is None:
+                time.sleep(0.03)
+                continue
 
-        # Initialize tracker on first good detection
-        if target_detected and best_bbox and self.tracker is None:
-            self.tracker = cv2.TrackerCSRT_create()
-            self.tracker.init(rgb, best_bbox)
-            self.tracked_bbox = best_bbox
-            print(f"✅ Locked onto {self.target_class}! Starting approach...")
+            detections = self.run_detection_and_tracking(frame, depth, scan)
+            with self.frame_lock:
+                self.latest_detections = detections
 
-        # Update tracker
-        tracked_ok = False
-        cx = cy = None
-        if self.tracker is not None:
-            ok, box = self.tracker.update(rgb)
-            if ok:
-                tracked_ok = True
-                self.lost_frames = 0
-                x, y, ww, hh = map(int, box)
-                self.tracked_bbox = (x, y, x+ww, y+hh)
-                cx = x + ww//2
-                cy = y + hh//2
-            else:
-                self.lost_frames += 1
+            time.sleep(0.06)  # ~16 Hz detect/track loop
 
-        # Re-seed tracker if YOLO sees the target again
-        if not tracked_ok and target_detected and best_bbox:
-            self.tracker = cv2.TrackerCSRT_create()
-            self.tracker.init(rgb, best_bbox)
-            self.tracked_bbox = best_bbox
-            tracked_ok = True
-            cx = (best_bbox[0] + best_bbox[2]) // 2
-            cy = (best_bbox[1] + best_bbox[3]) // 2
+    def run_detection_and_tracking(self, rgb, depth, scan):
+        target_classes = sorted(self.canonical_classes())
+        class_ids = [idx for idx, name in self.model.names.items() if name.lower() in target_classes] if target_classes else None
 
-        if tracked_ok and self.tracked_bbox:
-            x1, y1, x2, y2 = self.tracked_bbox
-            cv2.rectangle(rgb, (x1, y1), (x2, y2), (255, 0, 0), 4)  # Blue = tracked target
+        results = self.model.track(
+            source=rgb,
+            persist=True,
+            tracker='bytetrack.yaml',
+            conf=0.30,
+            iou=0.45,
+            imgsz=640,
+            classes=class_ids if class_ids else None,
+            verbose=False,
+        )
 
-        # Control
-        twist = Twist()
-        status = "SEARCHING"
-        distance = None
+        detections = []
+        result = results[0]
+        boxes = result.boxes
+        ids = boxes.id.int().cpu().tolist() if boxes.id is not None else [None] * len(boxes)
 
-        if tracked_ok and cx is not None:
-            distance = self.estimate_distance(depth, cx, cy)
+        for box, track_id in zip(boxes, ids):
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            class_name = self.model.names[int(box.cls[0])].lower()
+            conf = float(box.conf[0])
+            threshold = self.class_thresholds.get(class_name, 0.45)
+            if conf < threshold:
+                continue
 
-        if self.mission_active and self.target_class:
-            if tracked_ok and cx is not None:
-                status = "TRACKING"
-                error = (w // 2 - cx) / (w / 2.0)
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+            depth_m = self.estimate_distance(depth, (x1, y1, x2, y2))
+            bearing = self.pixel_to_bearing(cx, rgb.shape[1])
+            scan_m = self.range_at_bearing(scan, bearing)
+            fused_distance = self.fuse_range(depth_m, scan_m)
 
-                if distance and distance <= self.stop_distance:
-                    status = "COMPLETED"
-                    self.mission_active = False
-                    self.reset_tracking()
-                    twist.linear.x = twist.angular.z = 0.0
-                    print(f"\n🎉 MISSION COMPLETED! Reached {self.target_class}")
-                elif abs(error) > 0.15:
-                    twist.angular.z = 0.9 * error   # Strong centering
-                    twist.linear.x = 0.0
-                else:
-                    twist.linear.x = max(0.12, min(0.38, (distance or 2.0) * 0.18))
-                    twist.angular.z = 0.4 * error   # Small correction while moving
-            else:
-                status = "SEARCHING"
-                twist.angular.z = 0.5   # Rotate to search
+            detections.append({
+                'bbox': (x1, y1, x2, y2),
+                'cx': cx,
+                'cy': cy,
+                'conf': conf,
+                'class_name': class_name,
+                'track_id': track_id,
+                'distance': fused_distance,
+                'depth_distance': depth_m,
+                'scan_distance': scan_m,
+                'bearing': bearing,
+            })
 
-        self.cmd_vel_pub.publish(twist)
+        return detections
 
-        # Dashboard
-        dash = np.zeros((h, 450, 3), dtype=np.uint8)
-        cv2.putText(dash, "OBJECT HUNTER", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,255), 2)
-        cv2.putText(dash, f"TARGET: {self.target_class or 'None'}", (20,80), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255,255,0), 2)
-        cv2.putText(dash, f"STATUS: {status}", (20,120), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0,255,0), 2)
-        if distance:
-            cv2.putText(dash, f"DIST: {distance:.2f}m", (20,160), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0,255,0), 2)
+    def pixel_to_bearing(self, cx, width):
+        norm = (cx - (width / 2.0)) / (width / 2.0)
+        return math.radians((self.horizontal_fov_deg / 2.0) * norm)
 
-        return np.hstack((rgb, dash))
+    def range_at_bearing(self, scan, bearing, window_deg=4.0):
+        if scan is None or not scan.ranges:
+            return None
+        if scan.angle_increment == 0.0:
+            return None
 
-    def estimate_distance(self, depth, cx, cy, size=11):
+        half_window = math.radians(window_deg)
+        a0 = bearing - half_window
+        a1 = bearing + half_window
+        i0 = max(0, int((a0 - scan.angle_min) / scan.angle_increment))
+        i1 = min(len(scan.ranges) - 1, int((a1 - scan.angle_min) / scan.angle_increment))
+        if i1 < i0:
+            i0, i1 = i1, i0
+
+        vals = []
+        for i in range(i0, i1 + 1):
+            r = scan.ranges[i]
+            if scan.range_min < r < scan.range_max and math.isfinite(r):
+                vals.append(r)
+
+        return float(np.median(vals)) if vals else None
+
+    def front_clearance(self, scan, window_deg=12.0):
+        return self.range_at_bearing(scan, 0.0, window_deg)
+
+    def estimate_distance(self, depth, bbox):
         if depth is None:
             return None
-        half = size // 2
-        h, w = depth.shape
-        x1 = max(0, cx - half)
-        x2 = min(w, cx + half + 1)
-        y1 = max(0, cy - half)
-        y2 = min(h, cy + half + 1)
-        region = depth[y1:y2, x1:x2]
-        valid = region[(region > 0.2) & np.isfinite(region)]
-        return float(np.median(valid)) if len(valid) > 5 else None
+
+        x1, y1, x2, y2 = bbox
+        h, w = depth.shape[:2]
+
+        bw = max(6, x2 - x1)
+        bh = max(6, y2 - y1)
+
+        # central-lower ROI is usually more stable than exact center pixel
+        rx1 = max(0, x1 + int(0.25 * bw))
+        rx2 = min(w, x2 - int(0.25 * bw))
+        ry1 = max(0, y1 + int(0.45 * bh))
+        ry2 = min(h, y2 - int(0.10 * bh))
+
+        region = depth[ry1:ry2, rx1:rx2]
+        if region.size == 0:
+            return None
+
+        valid = region[np.isfinite(region) & (region > 0.15) & (region < 8.0)]
+        if valid.size < 15:
+            return None
+
+        return float(np.median(valid))
+
+    def fuse_range(self, depth_m, scan_m):
+        vals = [v for v in [depth_m, scan_m] if v is not None and math.isfinite(v)]
+        return float(min(vals)) if vals else None
+
+    def choose_target(self, detections, width, height):
+        if not detections:
+            return None
+
+        target_dets = [d for d in detections if self.is_target_match(d['class_name'])]
+        if not target_dets:
+            return None
+
+        # keep same ID if possible
+        if self.target_track_id is not None:
+            for det in target_dets:
+                if det['track_id'] == self.target_track_id:
+                    return det
+
+        pred = self.predict_target()
+        pred_cx = width / 2.0 if pred is None else float(pred[0])
+        pred_cy = height / 2.0 if pred is None else float(pred[1])
+        pred_dist = None if pred is None else float(pred[2])
+
+        def det_score(det):
+            area = (det['bbox'][2] - det['bbox'][0]) * (det['bbox'][3] - det['bbox'][1])
+            center_penalty = abs(det['cx'] - pred_cx) / max(1.0, width)
+            vertical_penalty = abs(det['cy'] - pred_cy) / max(1.0, height)
+            dist_penalty = 0.0
+            if pred_dist is not None and det['distance'] is not None:
+                dist_penalty = min(1.0, abs(det['distance'] - pred_dist) / 2.0)
+            return (2.0 * det['conf']) + (0.000002 * area) - center_penalty - 0.5 * vertical_penalty - 0.6 * dist_penalty
+
+        target_dets.sort(key=det_score, reverse=True)
+        return target_dets[0]
+
+    def predict_target(self):
+        if not self.kf_initialized:
+            return None
+        pred = self.kf.predict()
+        self.smoothed_target = pred.copy()
+        return pred.reshape(-1)
+
+    def correct_target(self, cx, cy, dist):
+        measurement = np.array([[np.float32(cx)], [np.float32(cy)], [np.float32(dist)]])
+        if not self.kf_initialized:
+            self.kf.statePost = np.array([[cx], [cy], [dist], [0.0], [0.0], [0.0]], dtype=np.float32)
+            self.kf_initialized = True
+            self.smoothed_target = self.kf.statePost.copy()
+        else:
+            self.smoothed_target = self.kf.correct(measurement)
+        return self.smoothed_target.reshape(-1)
+
+    def is_goal_reached(self, distance, front_clear):
+        if distance is not None and distance <= (self.stop_distance + self.goal_tolerance):
+            return True
+        if front_clear is not None and front_clear <= (self.front_stop_distance + 0.03):
+            return True
+        return False
+
+    def search_behavior(self, twist, front_clear, now):
+        elapsed = now - self.search_phase_started
+        if elapsed > 4.0:
+            self.search_direction *= -1.0
+            self.search_phase_started = now
+
+        if front_clear is not None and front_clear < self.front_stop_distance:
+            twist.linear.x = 0.0
+            twist.angular.z = -0.5 * self.search_direction
+        elif front_clear is not None and front_clear > self.search_forward_clearance and elapsed > 2.0:
+            twist.linear.x = 0.08
+            twist.angular.z = 0.25 * self.search_direction
+        else:
+            twist.linear.x = 0.0
+            twist.angular.z = 0.45 * self.search_direction
+
+    def update_state_machine(self, rgb, depth, scan, detections):
+        h, w = rgb.shape[:2]
+        target = self.choose_target(detections, w, h)
+        now = time.time()
+
+        if target is not None:
+            self.target_track_id = target['track_id']
+            self.last_target_seen_time = now
+            measured_dist = target['distance'] if target['distance'] is not None else 3.0
+            filt = self.correct_target(target['cx'], target['cy'], measured_dist)
+            filt_cx, filt_cy, filt_dist = float(filt[0]), float(filt[1]), float(filt[2])
+        else:
+            filt = self.predict_target()
+            if filt is not None:
+                filt_cx, filt_cy, filt_dist = float(filt[0]), float(filt[1]), float(filt[2])
+            else:
+                filt_cx, filt_cy, filt_dist = w / 2.0, h / 2.0, None
+
+        front_clear = self.front_clearance(scan)
+        twist = Twist()
+
+        if self.state == MissionState.SEARCH:
+            if target is not None:
+                self.state = MissionState.TRACK
+            else:
+                self.search_behavior(twist, front_clear, now)
+
+        if self.state == MissionState.TRACK:
+            if target is None:
+                self.state = MissionState.RECOVER
+            else:
+                error = ((w / 2.0) - filt_cx) / (w / 2.0)
+                if abs(error) > 0.08:
+                    twist.angular.z = np.clip(0.9 * error, -self.max_angular_speed, self.max_angular_speed)
+                    twist.linear.x = 0.0
+                else:
+                    self.state = MissionState.APPROACH
+
+        if self.state == MissionState.APPROACH:
+            if target is None:
+                self.state = MissionState.RECOVER
+            else:
+                error = ((w / 2.0) - filt_cx) / (w / 2.0)
+                distance = target['distance'] if target['distance'] is not None else filt_dist
+
+                if self.is_goal_reached(distance, front_clear):
+                    self.state = MissionState.COMPLETE
+                    twist.linear.x = 0.0
+                    twist.angular.z = 0.0
+                    print(f'\n🎉 OBJECT FOUND: reached {self.target_class}')
+                elif front_clear is not None and front_clear <= self.front_stop_distance:
+                    self.state = MissionState.RECOVER
+                else:
+                    distance = 2.5 if distance is None else distance
+                    desired = np.clip(0.18 * (distance - self.stop_distance), 0.0, self.max_linear_speed)
+
+                    if front_clear is not None and front_clear < self.front_slow_distance:
+                        desired *= max(
+                            0.15,
+                            (front_clear - self.front_stop_distance) / max(0.05, self.front_slow_distance - self.front_stop_distance)
+                        )
+
+                    if abs(error) > 0.25:
+                        desired *= 0.2
+                    elif abs(error) > 0.12:
+                        desired *= 0.5
+
+                    twist.linear.x = desired
+                    twist.angular.z = np.clip(0.65 * error, -self.max_angular_speed, self.max_angular_speed)
+
+        if self.state == MissionState.RECOVER:
+            time_since_seen = now - self.last_target_seen_time if self.last_target_seen_time else 999.0
+            if target is not None:
+                self.state = MissionState.TRACK
+            elif time_since_seen < self.target_reacquire_timeout and self.kf_initialized:
+                error = ((w / 2.0) - filt_cx) / (w / 2.0)
+                twist.angular.z = np.clip(0.6 * error, -0.5, 0.5)
+                twist.linear.x = 0.0
+            elif time_since_seen < self.target_drop_timeout:
+                twist.angular.z = 0.35 * self.search_direction
+                twist.linear.x = 0.0
+            else:
+                self.target_track_id = None
+                self.state = MissionState.SEARCH
+                self.search_phase_started = now
+                self.search_behavior(twist, front_clear, now)
+
+        if self.state == MissionState.COMPLETE:
+            self.last_status_text = 'COMPLETE'
+            self.state = MissionState.IDLE
+            self.target_track_id = None
+            self.target_class = None
+            self.kf_initialized = False
+            return self.rate_limit_twist(Twist())
+
+        if self.state == MissionState.IDLE:
+            self.last_status_text = 'IDLE'
+            return self.rate_limit_twist(Twist())
+
+        self.last_status_text = self.state.name
+        return self.rate_limit_twist(twist)
+
+    def rate_limit_twist(self, twist):
+        now = time.time()
+        dt = max(0.02, now - self.last_cmd_time)
+        self.last_cmd_time = now
+
+        max_lin_step = self.max_linear_accel * dt
+        max_ang_step = self.max_angular_accel * dt
+
+        lin = self._ramp(self.prev_linear, twist.linear.x, max_lin_step)
+        ang = self._ramp(self.prev_angular, twist.angular.z, max_ang_step)
+
+        out = Twist()
+        out.linear.x = float(np.clip(lin, -self.max_linear_speed, self.max_linear_speed))
+        out.angular.z = float(np.clip(ang, -self.max_angular_speed, self.max_angular_speed))
+
+        self.prev_linear = out.linear.x
+        self.prev_angular = out.angular.z
+        return out
+
+    @staticmethod
+    def _ramp(current, desired, step):
+        if desired > current + step:
+            return current + step
+        if desired < current - step:
+            return current - step
+        return desired
+
+    def annotate(self, rgb, detections, commanded_twist):
+        canvas = rgb.copy()
+        selected = self.choose_target(detections, rgb.shape[1], rgb.shape[0])
+
+        for det in detections:
+            x1, y1, x2, y2 = det['bbox']
+            is_selected = selected is not None and det['bbox'] == selected['bbox']
+            color = (255, 0, 0) if is_selected else (0, 165, 255)
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
+            label = f"{det['class_name']} id={det['track_id']} {det['conf']:.2f}"
+            cv2.putText(canvas, label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+            if det['distance'] is not None:
+                cv2.putText(canvas, f"{det['distance']:.2f}m", (x1, y2 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+        if self.kf_initialized and self.smoothed_target is not None:
+            cx = int(float(self.smoothed_target[0]))
+            cy = int(float(self.smoothed_target[1]))
+            cv2.circle(canvas, (cx, cy), 8, (0, 255, 255), -1)
+            cv2.line(canvas, (canvas.shape[1] // 2, canvas.shape[0]), (cx, cy), (0, 255, 255), 2)
+
+        dash = np.zeros((canvas.shape[0], 430, 3), dtype=np.uint8)
+        lines = [
+            'OBJECT HUNTER',
+            f'Target: {self.target_class or "None"}',
+            f'State: {self.last_status_text}',
+            f'Locked ID: {self.target_track_id}',
+            f'cmd.v: {commanded_twist.linear.x:.2f} m/s',
+            f'cmd.w: {commanded_twist.angular.z:.2f} rad/s',
+        ]
+        y = 40
+        for i, line in enumerate(lines):
+            scale = 0.9 if i == 0 else 0.7
+            color = (0, 255, 255) if i == 0 else (255, 255, 255)
+            cv2.putText(dash, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2)
+            y += 42
+
+        return np.hstack((canvas, dash))
 
     def display_loop(self):
-        cv2.namedWindow("Object Hunter", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Object Hunter", 1600, 900)
+        cv2.namedWindow('Object Hunter', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Object Hunter', 1600, 900)
 
         while rclpy.ok() and self.running:
             with self.frame_lock:
-                rgb = self.latest_rgb.copy() if self.latest_rgb is not None else None
-                depth = self.latest_depth
+                rgb = None if self.latest_rgb is None else self.latest_rgb.copy()
+                depth = None if self.latest_depth is None else self.latest_depth.copy()
                 scan = self.latest_scan
+                detections = list(self.latest_detections)
 
-            if rgb is not None:
-                result = self.process_frame(rgb, depth, scan)
-                cv2.imshow("Object Hunter", result)
-            else:
+            if rgb is None:
                 placeholder = np.zeros((720, 1280, 3), dtype=np.uint8)
-                cv2.putText(placeholder, "Waiting for camera feed...", (200, 300),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,255), 3)
-                cv2.imshow("Object Hunter", placeholder)
+                cv2.putText(placeholder, 'Waiting for camera feed...', (220, 350),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
+                cv2.imshow('Object Hunter', placeholder)
+            else:
+                cmd = self.update_state_machine(rgb, depth, scan, detections)
+                self.cmd_vel_pub.publish(cmd)
+                annotated = self.annotate(rgb, detections, cmd)
+                cv2.imshow('Object Hunter', annotated)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -242,8 +580,11 @@ class ObjectHunterNode(Node):
 
     def stop(self):
         self.running = False
-        if self.spin_thread.is_alive():
-            self.spin_thread.join(timeout=1)
+        self.cmd_vel_pub.publish(Twist())
+        for th in [self.spin_thread, self.detect_thread, self.input_thread]:
+            if th.is_alive():
+                th.join(timeout=1.0)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -254,6 +595,7 @@ def main(args=None):
         node.stop()
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
