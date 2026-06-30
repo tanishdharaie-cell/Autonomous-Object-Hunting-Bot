@@ -1,33 +1,283 @@
-# Assignment 4: The Great Object Hunt - Short Report
+# Assignment 4 – The Great Object Hunt
 
-**Student Name:** [Tanish Dharaie]  
-**Roll Number:** [25B2217]  
-**Date:** 25 June 2026
+**Student Name:** Tanish Dharaie
 
-## 1. How Distance was Estimated
-- Primary method: Median value of a 13×13 pixel region around the center of the tracked bounding box from `/camera/depth_image`.
-- Fallback 1: Minimum range from `/scan` (LIDAR) in the front sector (±40 degrees).
-- Fallback 2: Bounding box size heuristic (large box = very close).
-- This multi-sensor fusion makes distance estimation stable even when depth camera fails at close range.
+**Roll Number:** 25B2217
 
-## 2. How Search Behaviour Works
-- When target is not visible, the robot performs an intelligent alternating scan: rotates left and right (±60°) while moving slowly forward.
-- Uses OpenCV CSRT visual tracker + YOLO majority voting for robust re-acquisition.
-- On target loss, first attempts local re-acquisition (small sweep), then full search.
-- This allows the robot to explore other rooms effectively.
+**Electronics & Robotics Club, IIT Bombay**
 
-## 3. How Robot Decides When to Move and Stop
-- **Centering Phase**: Strong angular correction until object is nearly centered in the frame.
-- **Approach Phase**: Once centered, moves mostly straight forward with small corrections. Speed is proportional to estimated distance.
-- **Stopping Condition**: Robot stops when fused distance ≤ 0.6m OR bounding box becomes very large.
-- **Obstacle Avoidance**: If LIDAR detects obstacle < 0.45m ahead, robot moves backward briefly.
-- **State Machine with Hysteresis**: Prevents oscillation between searching and tracking due to temporary misdetections.
+---
 
-## Bonus Features Implemented
-- Continuous Assistant Mode (can hunt multiple objects without restarting the node)
-- Enhanced real-time dashboard showing target, status, distance, and FPS
-- Robust visual tracking using CSRT tracker + temporal voting
-- Multi-sensor distance fusion (Depth + LIDAR + bbox size)
+# Project Objective
 
-**GitHub Repository:** (https://github.com/tanishdharaie-cell/erc-assignment-4-object-hunt.git) 
-**Declaration:** This submission fulfills all stages (1-6) and most bonus challenges.
+The objective of this assignment is to develop an autonomous mobile robot capable of locating a user-specified object inside an unknown environment, navigating toward it safely, and reporting successful mission completion.
+
+The robot integrates computer vision, sensor fusion, state estimation, and autonomous motion control into a unified perception pipeline.
+
+---
+
+# System Overview
+
+The implemented system follows the architecture below.
+
+```
+User Input
+
+↓
+
+YOLOv8 Detection
+
+↓
+
+ByteTrack Multi-Object Tracking
+
+↓
+
+Kalman Filter Prediction
+
+↓
+
+Depth + LIDAR Fusion
+
+↓
+
+Mission State Machine
+
+↓
+
+Velocity Controller
+
+↓
+
+Robot Motion
+```
+
+---
+
+# Distance Estimation
+
+Object distance is estimated using multi-sensor fusion.
+
+## Primary Source
+
+Depth camera measurements extracted from the lower-central region of the detected bounding box.
+
+Using the median depth value significantly improves robustness against invalid depth pixels.
+
+---
+
+## Secondary Source
+
+2D LIDAR measurements are projected toward the object's bearing.
+
+A median filter is applied over a small angular window to suppress noise.
+
+---
+
+## Fusion Strategy
+
+The final distance estimate is computed by combining
+
+- depth measurements
+- laser measurements
+
+using conservative minimum-range fusion.
+
+Advantages include
+
+- improved robustness
+- reduced depth noise
+- better performance at close distances
+- reliable stopping behavior
+
+---
+
+# Object Detection and Tracking
+
+Object perception is performed using YOLOv8.
+
+The detector provides
+
+- object category
+- confidence
+- bounding box
+
+Multiple detections are associated using ByteTrack to preserve target identity across frames.
+
+The robot prioritizes
+
+1. previously tracked ID
+
+2. Kalman prediction
+
+3. highest confidence candidate
+
+This strategy minimizes identity switching when multiple similar objects appear.
+
+---
+
+# Kalman Filter
+
+A six-state Kalman Filter estimates
+
+- image position
+- velocity
+- target distance
+
+State vector
+
+```
+[cx, cy, distance, vx, vy, vdistance]
+```
+
+The prediction model enables
+
+- temporary occlusion handling
+- smoother object following
+- reduced steering oscillation
+- stable approach behavior
+
+---
+
+# Search Strategy
+
+When the target is not visible, the robot enters the SEARCH state.
+
+The robot
+
+- performs alternating rotational scans
+- periodically advances into unexplored regions
+- checks front LIDAR clearance
+- avoids rotating indefinitely in one direction
+
+This exploration behavior increases the probability of target acquisition while maintaining collision safety.
+
+---
+
+# Navigation Strategy
+
+Navigation consists of two phases.
+
+## Target Alignment
+
+The robot first rotates until the object is centered inside the camera frame.
+
+Only after alignment does forward motion begin.
+
+---
+
+## Object Approach
+
+Forward speed is proportional to target distance.
+
+Angular corrections continue during motion to compensate for heading error.
+
+Velocity commands are acceleration-limited to eliminate sudden motion and wheel skidding.
+
+---
+
+# Collision Avoidance
+
+The robot continuously monitors frontal LIDAR clearance.
+
+Safety mechanisms include
+
+- emergency stop
+- dynamic speed reduction
+- obstacle-aware search behavior
+- minimum stopping distance
+
+This prevents the robot from colliding with obstacles while approaching the target.
+
+---
+
+# Mission State Machine
+
+The autonomous behavior is implemented using a finite-state machine.
+
+```
+IDLE
+
+↓
+
+SEARCH
+
+↓
+
+TRACK
+
+↓
+
+APPROACH
+
+↓
+
+RECOVER
+
+↓
+
+COMPLETE
+```
+
+Each state has clearly defined transition conditions, resulting in predictable and reliable autonomous behavior.
+
+---
+
+# Software Technologies
+
+- ROS2 Jazzy
+- Python
+- OpenCV
+- Ultralytics YOLOv8
+- ByteTrack
+- NumPy
+- CvBridge
+
+---
+
+# Key Contributions
+
+- Autonomous object search
+- Multi-object target association
+- Kalman Filter target prediction
+- Multi-sensor distance fusion
+- Intelligent recovery behavior
+- Smooth motion control
+- Collision-aware navigation
+- Continuous assistant mode
+- Professional visualization dashboard
+
+---
+
+# Current Limitations
+
+Although the implemented system satisfies the assignment objectives, several practical limitations remain.
+
+- Traffic cones are not included in the standard COCO dataset and require a custom-trained detector.
+- The robot performs reactive navigation and does not maintain a global map.
+- Long-duration target occlusions may require additional localization support.
+- Global exploration would benefit from integration with Navigation2 and SLAM.
+
+---
+
+# Future Work
+
+Future improvements include
+
+- Navigation2 integration
+- Visual SLAM
+- Robot Localization EKF
+- NVIDIA Isaac ROS Nvblox
+- Semantic mapping
+- Behavior Tree navigation
+- Dynamic obstacle prediction
+- Custom object detection models
+- Multi-camera perception
+
+---
+
+# Conclusion
+
+The developed autonomous object hunter successfully integrates perception, tracking, state estimation, sensor fusion, and motion control into a complete robotic pipeline. The robot is capable of autonomously searching for user-specified objects, maintaining robust target tracking using Kalman filtering and multi-object association, safely navigating through the environment using fused depth and LIDAR information, and terminating the mission upon successfully reaching the target.
+
+The overall architecture closely follows modern autonomous robotics design principles by separating perception, estimation, decision-making, and control into modular components, providing a scalable foundation for future integration with full navigation and SLAM frameworks.
