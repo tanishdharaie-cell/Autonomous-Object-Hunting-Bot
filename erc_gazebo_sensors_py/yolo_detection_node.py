@@ -254,5 +254,3 @@ if __name__ == '__main__':
     main()
 
 
-Test it and let me know the behavior. We can fine-tune further (e.g., PID gains, search pattern).
-You can now use this for your submission.
